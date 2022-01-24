@@ -14,6 +14,7 @@ INTERMEDIATE_KEYS = {'zvals_coarse', 'raw_rgb_coarse', 'raw_sigma_coarse', 'dept
 
 def render_rays(nerf: nn.Module,
                 bg_nerf: Optional[nn.Module],
+                image_embedding: Optional[nn.Module],
                 rays: torch.Tensor,
                 image_indices: Optional[torch.Tensor],
                 hparams: Namespace,
@@ -54,6 +55,7 @@ def render_rays(nerf: nn.Module,
                                                     sphere_center, sphere_radius, include_xyz_real)
 
             bg_results = _get_results(nerf=bg_nerf,
+                                      image_embedding=image_embedding,
                                       rays_d=rays_d[rays_with_bg],
                                       image_indices=image_indices[rays_with_bg] if image_indices is not None else None,
                                       hparams=hparams,
@@ -83,6 +85,7 @@ def render_rays(nerf: nn.Module,
 
     xyz_coarse = rays_o + rays_d * z_vals.unsqueeze(-1)
     results = _get_results(nerf=nerf,
+                           image_embedding=image_embedding,
                            rays_d=rays_d,
                            image_indices=image_indices,
                            hparams=hparams,
@@ -145,6 +148,7 @@ def render_rays(nerf: nn.Module,
         bg_pts, depth_real = _depth2pts_outside(rays_o[:1], rays_d[:1], bg_z_vals,
                                                 sphere_center, sphere_radius, include_xyz_real)
         grad_results = _get_results(nerf=bg_nerf,
+                                    image_embedding=image_embedding,
                                     rays_d=rays_d[:1],
                                     image_indices=image_indices[:1] if image_indices is not None else None,
                                     hparams=hparams,
@@ -168,6 +172,7 @@ def render_rays(nerf: nn.Module,
 
 
 def _get_results(nerf: nn.Module,
+                 image_embedding: Optional[nn.Module],
                  rays_d: torch.Tensor,
                  image_indices: Optional[torch.Tensor],
                  hparams: Namespace,
@@ -197,6 +202,7 @@ def _get_results(nerf: nn.Module,
     _inference(results=results,
                typ='coarse',
                nerf=to_use,
+               image_embedding=image_embedding,
                rays_d=rays_d,
                image_indices=image_indices,
                hparams=hparams,
@@ -237,6 +243,7 @@ def _get_results(nerf: nn.Module,
         _inference(results=results,
                    typ='fine',
                    nerf=to_use,
+                   image_embedding=image_embedding,
                    rays_d=rays_d,
                    image_indices=image_indices,
                    hparams=hparams,
@@ -261,6 +268,7 @@ def _get_results(nerf: nn.Module,
 def _inference(results: Dict[str, torch.Tensor],
                typ: str,
                nerf: nn.Module,
+               image_embedding: Optional[nn.Module],
                rays_d: torch.Tensor,
                image_indices: Optional[torch.Tensor],
                hparams: Namespace,
@@ -290,7 +298,7 @@ def _inference(results: Dict[str, torch.Tensor],
     rays_d_ = rays_d.repeat(1, N_samples_, 1).view(-1, rays_d.shape[-1])
 
     if image_indices is not None:
-        image_indices_ = image_indices.repeat(1, N_samples_, 1).view(-1, 1)
+        image_indices_ = image_indices.repeat(1, N_samples_, 1).view(-1)
 
     if hparams.pos_dir_dim == 0:
         if hparams.sh_deg is not None:
@@ -302,11 +310,17 @@ def _inference(results: Dict[str, torch.Tensor],
             #                                              device=xyz_chunk.device) if nerf.training else None
 
             if image_indices is not None:
-                model_chunk = nerf(torch.cat([xyz_chunk,
-                                              image_indices_[i:i + hparams.model_chunk_size]], 1),
-                                   sigma_only=False)
+                if hparams.container_path is not None or hparams.train_mega_nerf is not None:
+                    model_chunk = nerf(
+                        torch.cat([xyz_chunk, image_indices_[i:i + hparams.model_chunk_size].view(-1, 1)], 1),
+                        embedding_a=image_embedding)
+                else:
+                    model_chunk = nerf(torch.cat([xyz_chunk,
+                                                  image_embedding(
+                                                      image_indices_[i:i + hparams.model_chunk_size].long())],
+                                                 1))
             else:
-                model_chunk = nerf(xyz_chunk, sigma_only=False)
+                model_chunk = nerf(xyz_chunk)
 
             if hparams.sh_deg is not None:
                 rgb = torch.sigmoid(
@@ -324,19 +338,25 @@ def _inference(results: Dict[str, torch.Tensor],
             #                                              device=xyz_chunk.device) if nerf.training else None
 
             if image_indices is not None:
-                xyzdir = torch.cat([xyz_chunk,
-                                    rays_d_[i:i + hparams.model_chunk_size],
-                                    image_indices_[i:i + hparams.model_chunk_size]], 1)
+                if hparams.container_path is not None or hparams.train_mega_nerf is not None:
+                    xyzdir = torch.cat([xyz_chunk, rays_d_[i:i + hparams.model_chunk_size],
+                                        image_indices_[i:i + hparams.model_chunk_size].view(-1, 1)], 1)
+                    out_chunks += [nerf(xyzdir, embedding_a=image_embedding)]
+
+                else:
+                    xyzdir = torch.cat([xyz_chunk,
+                                        rays_d_[i:i + hparams.model_chunk_size],
+                                        image_embedding(image_indices_[i:i + hparams.model_chunk_size].long())], 1)
+                    out_chunks += [nerf(xyzdir)]
             else:
                 xyzdir = torch.cat([xyz_chunk, rays_d_[i:i + hparams.model_chunk_size]], 1)
-            out_chunks += [nerf(xyzdir, sigma_only=False)]
+                out_chunks += [nerf(xyzdir)]
 
     out = torch.cat(out_chunks, 0)
     out = out.view(N_rays_, N_samples_, out.shape[-1])
 
     rgbs = out[..., :3]  # (N_rays, N_samples_, 3)
     sigmas = out[..., 3]  # (N_rays, N_samples_)
-
 
     if 'zvals_coarse' in results:
         # combine coarse and fine samples

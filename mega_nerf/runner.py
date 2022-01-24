@@ -10,7 +10,6 @@ from argparse import Namespace
 from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict, Union
-from zipfile import ZipFile
 
 import cv2
 import numpy as np
@@ -31,7 +30,7 @@ from mega_nerf.datasets.memory_dataset import MemoryDataset
 from mega_nerf.image_metadata import ImageMetadata
 from mega_nerf.metrics import psnr, ssim, lpips
 from mega_nerf.misc_utils import main_print, main_tqdm
-from mega_nerf.models.model_utils import get_nerf, get_bg_nerf
+from mega_nerf.models.model_utils import get_nerf, get_bg_nerf, get_image_embedding
 from mega_nerf.ray_utils import get_rays, get_ray_directions
 from mega_nerf.rendering import render_rays
 
@@ -116,13 +115,13 @@ class Runner:
 
         main_print('Camera range in [-1, 1] space: {} {}'.format(min_position, max_position))
 
-        self.nerf = get_nerf(hparams, len(self.train_items)).to(self.device)
+        self.nerf = get_nerf(hparams).to(self.device)
         if 'RANK' in os.environ:
             self.nerf = torch.nn.parallel.DistributedDataParallel(self.nerf, device_ids=[int(os.environ['LOCAL_RANK'])],
                                                                   output_device=int(os.environ['LOCAL_RANK']))
 
         if hparams.bg_nerf:
-            self.bg_nerf = get_bg_nerf(hparams, len(self.train_items)).to(self.device)
+            self.bg_nerf = get_bg_nerf(hparams).to(self.device)
             if 'RANK' in os.environ:
                 self.bg_nerf = torch.nn.parallel.DistributedDataParallel(self.bg_nerf,
                                                                          device_ids=[int(os.environ['LOCAL_RANK'])],
@@ -158,6 +157,11 @@ class Runner:
             self.sphere_center = None
             self.sphere_radius = None
 
+        self.image_embedding = get_image_embedding(hparams, len(self.train_items)).to(
+            self.device) if hparams.appearance_dim > 0 else None
+        if self.image_embedding is not None and 'RANK' in os.environ:
+            self.image_embedding = torch.nn.parallel.DistributedDataParallel(self.image_embedding)
+
     def train(self):
         self._setup_experiment_dir()
 
@@ -167,6 +171,8 @@ class Runner:
         optimizers['nerf'] = Adam(self.nerf.parameters(), lr=self.hparams.lr)
         if self.bg_nerf is not None:
             optimizers['bg_nerf'] = Adam(self.bg_nerf.parameters(), lr=self.hparams.lr)
+        if self.image_embedding is not None:
+            optimizers['image_embedding'] = Adam(self.image_embedding.parameters(), lr=self.hparams.lr)
 
         if self.hparams.ckpt_path is not None:
             checkpoint = torch.load(self.hparams.ckpt_path, map_location='cpu')
@@ -260,6 +266,21 @@ class Runner:
 
                 scaler.scale(metrics['loss']).backward()
 
+                if 'RANK' in os.environ:
+                    for optimizer in optimizers.values():
+                        scaler.unscale_(optimizer)
+
+                    max_nerf = 0
+                    for p in self.nerf.parameters():
+                        max_nerf = max(max_nerf, p.grad.norm())
+
+                    max_bg_nerf = 0
+                    for p in self.bg_nerf.parameters():
+                        max_bg_nerf = max(max_bg_nerf, p.grad.norm())
+
+                    if int(os.environ['RANK']) == 0:
+                        print(train_iterations, 'max', max_nerf, max_bg_nerf)
+
                 for key, optimizer in optimizers.items():
                     if key == 'bg_nerf' and (not bg_nerf_rays_present):
                         continue
@@ -344,6 +365,7 @@ class Runner:
             -> Tuple[Dict[str, Union[torch.Tensor, float]], bool]:
         results, bg_nerf_rays_present = render_rays(nerf=self.nerf,
                                                     bg_nerf=self.bg_nerf,
+                                                    image_embedding=self.image_embedding,
                                                     rays=rays,
                                                     image_indices=image_indices,
                                                     hparams=self.hparams,
@@ -526,6 +548,9 @@ class Runner:
         if self.bg_nerf is not None:
             dict['bg_model_state_dict'] = self.bg_nerf.state_dict()
 
+        if self.image_embedding is not None:
+            dict['image_embedding_state_dict'] = self.image_embedding.state_dict()
+
         torch.save(dict, self.model_path / '{}.pt'.format(train_index))
 
     def render_image(self, metadata: ImageMetadata) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
@@ -557,7 +582,9 @@ class Runner:
                 bg_nerf = self.bg_nerf
 
             for i in range(0, rays.shape[0], self.hparams.image_pixel_batch_size):
-                result_batch, _ = render_rays(nerf=nerf, bg_nerf=bg_nerf,
+                result_batch, _ = render_rays(nerf=nerf,
+                                              bg_nerf=bg_nerf,
+                                              image_embedding=self.image_embedding,
                                               rays=rays[i:i + self.hparams.image_pixel_batch_size],
                                               image_indices=image_indices[
                                                             i:i + self.hparams.image_pixel_batch_size] if self.hparams.appearance_dim > 0 else None,

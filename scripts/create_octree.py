@@ -219,7 +219,7 @@ def main(hparams: Namespace) -> None:
     poses = torch.cat([torch.load(x)['c2w'].unsqueeze(0) for x in metadata_paths])
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    nerf = get_nerf(hparams, poses.shape[0]).to(device).eval()
+    nerf = get_nerf(hparams).to(device).eval()
 
     coordinate_info = torch.load(dataset_path / 'coordinates.pt', map_location='cpu')
     origin_drb = coordinate_info['origin_drb']

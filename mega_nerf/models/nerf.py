@@ -44,7 +44,7 @@ class ShiftedSoftplus(nn.Module):
 
 class NeRF(nn.Module):
     def __init__(self, pos_xyz_dim: int, pos_dir_dim: int, layers: int, skip_layers: List[int], layer_dim: int,
-                 appearance_dim: int, appearance_count: int, rgb_dim: int, xyz_dim: int, sigma_activation: nn.Module):
+                 appearance_dim: int, rgb_dim: int, xyz_dim: int, sigma_activation: nn.Module):
         super(NeRF, self).__init__()
         self.xyz_dim = xyz_dim
 
@@ -78,10 +78,11 @@ class NeRF(nn.Module):
             self.embedding_dir = None
             in_channels_dir = 0
 
-        if appearance_dim > 0:
-            self.embedding_a = nn.Embedding(appearance_count, appearance_dim)
-        else:
-            self.embedding_a = None
+        self.appearance_dim = appearance_dim
+        # if appearance_dim > 0:
+        #     self.embedding_a = nn.Embedding(appearance_count, appearance_dim)
+        # else:
+        #     self.embedding_a = None
 
         if pos_dir_dim > 0 or appearance_dim > 0:
             self.xyz_encoding_final = nn.Linear(layer_dim, layer_dim)
@@ -92,8 +93,7 @@ class NeRF(nn.Module):
             self.xyz_encoding_final = None
 
         # output layers
-        self.sigma = nn.Linear(layer_dim, 1)
-        self.sigma_activation = sigma_activation
+        self.sigma = nn.Sequential(nn.Linear(layer_dim, 1), sigma_activation)
 
         rgb = nn.Linear(layer_dim // 2 if (pos_dir_dim > 0 or appearance_dim > 0) else layer_dim, rgb_dim)
         if rgb_dim == 3:
@@ -101,11 +101,10 @@ class NeRF(nn.Module):
         else:
             self.rgb = rgb  # We're using spherical harmonics and will convert to sigmoid in rendering.py
 
-    def forward(self, x: torch.Tensor, sigma_only: bool = False,
-                sigma_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sigma_only: bool = False) -> torch.Tensor:
         expected = self.xyz_dim \
                    + (0 if (sigma_only or self.embedding_dir is None) else 3) \
-                   + (0 if (sigma_only or self.embedding_a is None) else 1)
+                   + (0 if sigma_only else self.appearance_dim)
 
         if x.shape[1] != expected:
             raise Exception(
@@ -119,9 +118,6 @@ class NeRF(nn.Module):
             xyz_ = xyz_encoding(xyz_)
 
         sigma = self.sigma(xyz_)
-        if sigma_noise is not None:
-            sigma += sigma_noise
-        sigma = self.sigma_activation(sigma)
 
         if sigma_only:
             return sigma
@@ -131,10 +127,10 @@ class NeRF(nn.Module):
             dir_a_encoding_input = [xyz_encoding_final]
 
             if self.embedding_dir is not None:
-                dir_a_encoding_input.append(self.embedding_dir(x[:, -4:-1]))
+                dir_a_encoding_input.append(self.embedding_dir(x[:, self.xyz_dim:self.xyz_dim + 3]))
 
-            if self.embedding_a is not None:
-                dir_a_encoding_input.append(self.embedding_a(x[:, -1].long()))
+            if self.appearance_dim > 0:
+                dir_a_encoding_input.append(x[:, -self.appearance_dim:])
 
             dir_a_encoding = self.dir_a_encoding(torch.cat(dir_a_encoding_input, -1))
             rgb = self.rgb(dir_a_encoding)

@@ -2,11 +2,12 @@ from argparse import Namespace
 from pathlib import Path
 
 import torch
+from torch import nn
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
 from mega_nerf.models.mega_nerf import MegaNeRF
 from mega_nerf.models.mega_nerf_container import MegaNeRFContainer
-from mega_nerf.models.model_utils import get_nerf, get_bg_nerf
+from mega_nerf.models.model_utils import get_nerf, get_bg_nerf, get_image_embedding
 from mega_nerf.opts import get_opts_base
 
 
@@ -30,6 +31,8 @@ def main(hparams: Namespace) -> None:
 
     sub_modules = []
     bg_sub_modules = []
+    image_embeddings = []
+
     for i in range(len(centroids)):
         centroid_path = ckpt_prefix.parent / '{}{}'.format(ckpt_prefix.name, i)
 
@@ -48,12 +51,7 @@ def main(hparams: Namespace) -> None:
         loaded = torch.load(checkpoint, map_location='cpu')
         consume_prefix_in_state_dict_if_present(loaded['model_state_dict'], prefix='module.')
 
-        if hparams.appearance_dim > 0:
-            appearance_count = len(loaded['model_state_dict']['embedding_a.weight'])
-        else:
-            appearance_count = 0
-
-        sub_module = get_nerf(hparams, appearance_count)
+        sub_module = get_nerf(hparams)
         model_dict = sub_module.state_dict()
         model_dict.update(loaded['model_state_dict'])
         sub_module.load_state_dict(model_dict)
@@ -61,18 +59,25 @@ def main(hparams: Namespace) -> None:
 
         if 'bg_model_state_dict' in loaded:
             consume_prefix_in_state_dict_if_present(loaded['bg_model_state_dict'], prefix='module.')
-            sub_module = get_bg_nerf(hparams, appearance_count)
+            sub_module = get_bg_nerf(hparams)
             model_dict = sub_module.state_dict()
             model_dict.update(loaded['bg_model_state_dict'])
             sub_module.load_state_dict(model_dict)
             bg_sub_modules.append(sub_module)
 
-    container = MegaNeRFContainer(sub_modules, bg_sub_modules, centroids,
+        if 'image_embedding_state_dict' in loaded:
+            consume_prefix_in_state_dict_if_present(loaded['image_embedding_state_dict'], prefix='module.')
+            sub_module = get_image_embedding(hparams, len(loaded['image_embedding_state_dict']['weight']))
+            model_dict = sub_module.state_dict()
+            model_dict.update(loaded['image_embedding_state_dict'])
+            sub_module.load_state_dict(model_dict)
+            image_embeddings.append(sub_module)
+
+    container = MegaNeRFContainer(sub_modules, bg_sub_modules, image_embeddings, centroids,
                                   torch.IntTensor(centroid_metadata['grid_dim']),
                                   centroid_metadata['min_position'],
                                   centroid_metadata['max_position'],
-                                  hparams.pos_dir_dim > 0,
-                                  hparams.appearance_dim > 0)
+                                  hparams.pos_dir_dim > 0)
 
     Path(hparams.output).parent.mkdir(parents=True, exist_ok=True)
     torch.jit.save(torch.jit.script(container.eval()), hparams.output)
@@ -82,20 +87,26 @@ def main(hparams: Namespace) -> None:
     nerf = MegaNeRF([getattr(container, 'sub_module_{}'.format(i)) for i in range(len(container.centroids))],
                     container.centroids, hparams.boundary_margin, False).to(device)
 
+    if len(image_embeddings) > 0:
+        embedding_a = nn.ModuleList(
+            [getattr(container, 'image_embedding_{}'.format(i)) for i in range(len(container.centroids))]).to(device)
+    else:
+        embedding_a = None
+
     width = 3
     if hparams.pos_dir_dim > 0:
         width += 3
     if hparams.appearance_dim > 0:
         width += 1
 
-    print('fg test eval: {}'.format(nerf(torch.ones(1, width, device=device))))
+    print('fg test eval: {}'.format(nerf(torch.ones(1, width, device=device), embedding_a=embedding_a)))
 
     if len(bg_sub_modules) > 0:
         bg_nerf = MegaNeRF([getattr(container, 'bg_sub_module_{}'.format(i)) for i in range(len(container.centroids))],
                            container.centroids, hparams.boundary_margin, True).to(device)
 
         width += 4
-        print('bg test eval: {}'.format(bg_nerf(torch.ones(1, width, device=device))))
+        print('bg test eval: {}'.format(bg_nerf(torch.ones(1, width, device=device), embedding_a=embedding_a)))
 
 
 if __name__ == '__main__':
