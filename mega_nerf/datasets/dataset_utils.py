@@ -25,6 +25,12 @@ def get_image_data(metadata: ImageMetadata, near: float, far: float, ray_altitud
     if metadata.is_val:
         if keep_mask is None:
             keep_mask = torch.ones(metadata.H, metadata.W, dtype=torch.bool)
+        else:
+            discard_half = keep_mask[:, metadata.W // 2:]
+            discard_pos_count = discard_half[discard_half == True].shape[0]
+            candidates_to_add = torch.arange(metadata.H * metadata.W).view(metadata.H, metadata.W)[:, :metadata.W // 2].reshape(-1)
+            to_add = candidates_to_add[torch.randperm(candidates_to_add.shape[0])[:discard_pos_count]]
+            keep_mask.view(-1).scatter_(0, to_add, torch.ones_like(to_add, dtype=torch.bool))
 
         keep_mask[:, metadata.W // 2:] = False
 

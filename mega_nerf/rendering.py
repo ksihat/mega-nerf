@@ -137,7 +137,7 @@ def render_rays(nerf: nn.Module,
 
     bg_nerf_rays_present = bg_nerf is not None and rays_with_bg.shape[0] > 0
 
-    if bg_nerf is not None and not bg_nerf_rays_present and 'RANK' in os.environ and nerf.training:
+    if bg_nerf is not None and (not bg_nerf_rays_present) and 'RANK' in os.environ and nerf.training:
         bg_z_vals = torch.linspace(0, 1, hparams.coarse_samples // 2, device=rays.device)
         bg_z_vals = _expand_and_perturb_z_vals(bg_z_vals, hparams.coarse_samples // 2, perturb, 1)
 
@@ -298,14 +298,15 @@ def _inference(results: Dict[str, torch.Tensor],
 
         for i in range(0, B, hparams.model_chunk_size):
             xyz_chunk = xyz_[i:i + hparams.model_chunk_size]
-            sigma_noise = torch.rand(len(xyz_chunk), 1, device=xyz_chunk.device) if nerf.training else None
+            # sigma_noise = hparams.noise_std * torch.rand(len(xyz_chunk), 1,
+            #                                              device=xyz_chunk.device) if nerf.training else None
 
             if image_indices is not None:
                 model_chunk = nerf(torch.cat([xyz_chunk,
                                               image_indices_[i:i + hparams.model_chunk_size]], 1),
-                                   sigma_only=False, sigma_noise=sigma_noise)
+                                   sigma_only=False)
             else:
-                model_chunk = nerf(xyz_chunk, sigma_only=False, sigma_noise=sigma_noise)
+                model_chunk = nerf(xyz_chunk, sigma_only=False)
 
             if hparams.sh_deg is not None:
                 rgb = torch.sigmoid(
@@ -319,7 +320,8 @@ def _inference(results: Dict[str, torch.Tensor],
         # (N_rays*N_samples_, embed_dir_channels)
         for i in range(0, B, hparams.model_chunk_size):
             xyz_chunk = xyz_[i:i + hparams.model_chunk_size]
-            sigma_noise = torch.rand(len(xyz_chunk), 1, device=xyz_chunk.device) if nerf.training else None
+            # sigma_noise = hparams.noise_std * torch.rand(len(xyz_chunk), 1,
+            #                                              device=xyz_chunk.device) if nerf.training else None
 
             if image_indices is not None:
                 xyzdir = torch.cat([xyz_chunk,
@@ -327,13 +329,14 @@ def _inference(results: Dict[str, torch.Tensor],
                                     image_indices_[i:i + hparams.model_chunk_size]], 1)
             else:
                 xyzdir = torch.cat([xyz_chunk, rays_d_[i:i + hparams.model_chunk_size]], 1)
-            out_chunks += [nerf(xyzdir, sigma_only=False, sigma_noise=sigma_noise)]
+            out_chunks += [nerf(xyzdir, sigma_only=False)]
 
     out = torch.cat(out_chunks, 0)
     out = out.view(N_rays_, N_samples_, out.shape[-1])
 
     rgbs = out[..., :3]  # (N_rays, N_samples_, 3)
     sigmas = out[..., 3]  # (N_rays, N_samples_)
+
 
     if 'zvals_coarse' in results:
         # combine coarse and fine samples
@@ -348,8 +351,7 @@ def _inference(results: Dict[str, torch.Tensor],
         sigmas = torch.gather(torch.cat((sigmas, results['raw_sigma_coarse']), 1), 1, ordering)
 
         if depth_real is not None:
-            depth_real = torch.gather(torch.cat((depth_real, results['depth_real_coarse']), 1), 1,
-                                      ordering)
+            depth_real = torch.gather(torch.cat((depth_real, results['depth_real_coarse']), 1), 1, ordering)
 
     # Convert these values using volume rendering (Section 4)
     if flip:
@@ -358,7 +360,13 @@ def _inference(results: Dict[str, torch.Tensor],
         deltas = z_vals[:, 1:] - z_vals[:, :-1]  # (N_rays, N_samples_-1)
 
     deltas = torch.cat([deltas, last_delta], -1)  # (N_rays, N_samples_)
-    alphas = 1 - torch.exp(-deltas * sigmas)  # (N_rays, N_samples_)
+
+    if nerf.training:
+        sigma_factor = F.relu(sigmas + hparams.noise_std * torch.randn_like(sigmas))
+    else:
+        sigma_factor = sigmas
+
+    alphas = 1 - torch.exp(-deltas * sigma_factor)  # (N_rays, N_samples_)
 
     T = torch.cumprod(1 - alphas + 1e-8, -1)
     if get_bg_lambda:
@@ -459,6 +467,9 @@ def _depth2pts_outside(rays_o: torch.Tensor, rays_d: torch.Tensor, depth: torch.
     if include_xyz_real:
         boundary = rays_o_orig + rays_d_orig * (d1 + d2).unsqueeze(-1)
         pts = torch.cat((boundary.repeat(1, p_sphere_new.shape[1], 1), p_sphere_new, depth.unsqueeze(-1)), dim=-1)
+        # pts = torch.cat(
+        #     (rays_o_orig + rays_d_orig * depth_real.unsqueeze(-1), p_sphere_new, depth.unsqueeze(-1)),
+        #     dim=-1)
     else:
         pts = torch.cat((p_sphere_new, depth.unsqueeze(-1)), dim=-1)
 
@@ -490,7 +501,7 @@ def _sample_pdf(bins: torch.Tensor, weights: torch.Tensor, fine_samples: int, de
     Outputs:
         samples: the sampled samples
     """
-    weights = weights + 1e-8  # prevent division by zero (don't do inplace op!)
+    weights = weights + 1e-5  # prevent division by zero (don't do inplace op!)
 
     pdf = weights / weights.sum(-1).unsqueeze(-1)  # (N_rays, N_samples_)
 
@@ -524,7 +535,7 @@ def _sample_cdf(bins: torch.Tensor, cdf: torch.Tensor, fine_samples: int, det: b
     bins_g = bins_g.view(bins_g.shape[0], -1, 2)  # n1 (n2 2) -> n1 n2 2
 
     denom = cdf_g[..., 1] - cdf_g[..., 0]
-    denom[denom < 1e-8] = 1  # denom equals 0 means a bin has weight 0,
+    denom[denom < 1e-5] = 1  # denom equals 0 means a bin has weight 0,
     # in which case it will not be sampled
     # anyway, therefore any value for it is fine (set to 1 here)
 

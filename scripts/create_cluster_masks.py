@@ -111,15 +111,15 @@ def main(hparams: Namespace) -> None:
 
     for subdir in ['train', 'val']:
         metadata_paths = list((dataset_path / subdir / 'metadata').iterdir())
-        for i in main_tqdm(np.arange(rank, len(metadata_paths), world_size)):
-            metadata_path = metadata_paths[i]
+        for metadata_index in main_tqdm(np.arange(rank, len(metadata_paths), world_size)):
+            metadata_path = metadata_paths[metadata_index]
 
             if hparams.resume:
                 # Check to see if mask has been generated already
                 all_valid = True
                 filename = metadata_path.stem + '.pt'
-                for i in range(centroids.shape[0]):
-                    mask_path = output_path / str(i) / filename
+                for centroid_index in range(centroids.shape[0]):
+                    mask_path = output_path / str(centroid_index) / filename
                     if not mask_path.exists():
                         all_valid = False
                         break
@@ -152,12 +152,12 @@ def main(hparams: Namespace) -> None:
             rays = get_rays(directions, c2w, near, far, ray_altitude_range).view(-1, 8)
 
             min_dist_ratios = []
-            for j in range(0, rays.shape[0], hparams.ray_chunk_size):
-                rays_o = rays[j:j + hparams.ray_chunk_size, :3]
-                rays_d = rays[j:j + hparams.ray_chunk_size, 3:6]
+            for ray_index in range(0, rays.shape[0], hparams.ray_chunk_size):
+                rays_o = rays[ray_index:ray_index + hparams.ray_chunk_size, :3]
+                rays_d = rays[ray_index:ray_index + hparams.ray_chunk_size, 3:6]
+                near_bounds = rays[ray_index:ray_index + hparams.ray_chunk_size, 6:7]
+                far_bounds = rays[ray_index:ray_index + hparams.ray_chunk_size, 7:8]
 
-                near_bounds, far_bounds = rays[j:j + hparams.ray_chunk_size, 6:7], \
-                                          rays[j:j + hparams.ray_chunk_size, 7:8]  # both (N_rays, 1)
                 z_vals = near_bounds * (1 - z_steps) + far_bounds * z_steps
 
                 xyz = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals.unsqueeze(-1)
@@ -167,8 +167,8 @@ def main(hparams: Namespace) -> None:
 
                 min_distances = []
                 cluster_distances = []
-                for i in range(0, xyz.shape[0], hparams.dist_chunk_size):
-                    distances = torch.cdist(xyz[i:i + hparams.dist_chunk_size], centroids)
+                for point_index in range(0, xyz.shape[0], hparams.dist_chunk_size):
+                    distances = torch.cdist(xyz[point_index:point_index + hparams.dist_chunk_size], centroids)
                     cluster_distances.append(distances)
                     min_distances.append(distances.min(dim=1)[0])
 
@@ -185,12 +185,13 @@ def main(hparams: Namespace) -> None:
 
             min_dist_ratios = torch.cat(min_dist_ratios).view(metadata['H'], metadata['W'], centroids.shape[0])
 
-            for i in range(centroids.shape[0]):
-                cluster_ratios = min_dist_ratios[:, :, i]
+            for save_centroid_index in range(centroids.shape[0]):
+                cluster_ratios = min_dist_ratios[:, :, save_centroid_index]
                 ray_in_cluster = cluster_ratios <= hparams.boundary_margin
 
                 filename = (metadata_path.stem + '.pt')
-                with ZipFile(output_path / str(i) / filename, compression=zipfile.ZIP_DEFLATED, mode='w') as zf:
+                with ZipFile(output_path / str(save_centroid_index) / filename, compression=zipfile.ZIP_DEFLATED,
+                             mode='w') as zf:
                     with zf.open(filename, 'w') as f:
                         torch.save(ray_in_cluster.cpu(), f)
 

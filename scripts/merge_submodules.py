@@ -73,6 +73,8 @@ def main(hparams: Namespace) -> None:
                                   centroid_metadata['max_position'],
                                   hparams.pos_dir_dim > 0,
                                   hparams.appearance_dim > 0)
+
+    Path(hparams.output).parent.mkdir(parents=True, exist_ok=True)
     torch.jit.save(torch.jit.script(container.eval()), hparams.output)
     container = torch.jit.load(hparams.output, map_location='cpu')
 

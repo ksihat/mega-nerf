@@ -37,7 +37,7 @@ from mega_nerf.rendering import render_rays
 
 
 class Runner:
-    def __init__(self, hparams: Namespace, set_experiment_path: bool=True):
+    def __init__(self, hparams: Namespace, set_experiment_path: bool = True):
         faulthandler.register(signal.SIGUSR1)
 
         if hparams.ckpt_path is not None:

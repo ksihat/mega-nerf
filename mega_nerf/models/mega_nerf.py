@@ -5,7 +5,7 @@ from torch import nn
 
 
 class MegaNeRF(nn.Module):
-    def __init__(self, sub_modules: List[nn.Module], centroids: torch.Tensor, boundary_margin: int, xyz_real: bool,
+    def __init__(self, sub_modules: List[nn.Module], centroids: torch.Tensor, boundary_margin: float, xyz_real: bool,
                  joint_training: bool = False):
         super(MegaNeRF, self).__init__()
         self.sub_modules = nn.ModuleList(sub_modules)
