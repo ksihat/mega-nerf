@@ -11,6 +11,20 @@ import torch
 import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from pytictoc import TicToc  # pip install pytictoc
+
+print('####################### KSI : Setting Path #########################################')
+import sys
+tmp_path_cwd = os.getcwd()
+# print(os.path.realpath(__file__))
+# sys.path.append(os.getcwd() + '/./')
+sys.path.append(tmp_path_cwd)
+os.chdir(tmp_path_cwd)
+print(tmp_path_cwd)
+print(sys.path)
+print('####################### KSI : Setting Path : END ####################################')
+
+
 from mega_nerf.misc_utils import main_tqdm, main_print
 from mega_nerf.opts import get_opts_base
 from mega_nerf.ray_utils import get_ray_directions, get_rays
@@ -34,6 +48,9 @@ def _get_mask_opts() -> Namespace:
 @torch.inference_mode()
 def main(hparams: Namespace) -> None:
     assert hparams.ray_altitude_range is not None
+    t = TicToc()
+    t.tic()  # 시작 시간
+
     output_path = Path(hparams.output)
 
     if 'RANK' in os.environ:
@@ -45,6 +62,8 @@ def main(hparams: Namespace) -> None:
         dist.barrier()
         world_size = int(os.environ['WORLD_SIZE'])
     else:
+        print(output_path)
+        hparams.resume = True
         output_path.mkdir(parents=True, exist_ok=hparams.resume)
         rank = 0
         world_size = 1
@@ -102,16 +121,27 @@ def main(hparams: Namespace) -> None:
     z_steps = torch.linspace(0, 1, hparams.ray_samples, device=device)  # (N_samples)
     centroids = centroids.to(device)
 
-    if rank == 0 and not hparams.resume:
+    # if rank == 0 and not hparams.resume:  # original
+    if rank == 0: # ksi
         for i in range(centroids.shape[0]):
-            (output_path / str(i)).mkdir(parents=True)
+            output_path_i = (output_path / str(i))
+            if not os.path.exists(output_path_i):
+                output_path_i.mkdir(parents=True)
+                print('mkdir : {}'.format(output_path_i))
+
+    t.toc()  # 종료 시간
 
     if 'RANK' in os.environ:
         dist.barrier()
 
     for subdir in ['train', 'val']:
         metadata_paths = list((dataset_path / subdir / 'metadata').iterdir())
+        print('len(metadata_paths) : {}'.format(len(metadata_paths)))
+        t.toc()  # 종료 시간
         for i in main_tqdm(np.arange(rank, len(metadata_paths), world_size)):
+            print('[{}/{}] metadata_paths'.format(i, len(metadata_paths)))
+            t.toc()  # 종료 시간
+
             metadata_path = metadata_paths[i]
 
             if hparams.resume:
@@ -151,8 +181,13 @@ def main(hparams: Namespace) -> None:
 
             rays = get_rays(directions, c2w, near, far, ray_altitude_range).view(-1, 8)
 
+            # print('hparams.ray_chunk_size : {}'.format(hparams.ray_chunk_size))
+            # t.toc()  # 종료 시간
             min_dist_ratios = []
             for j in range(0, rays.shape[0], hparams.ray_chunk_size):
+                # print('[{}/{}] ray_chunk_size'.format(j, hparams.ray_chunk_size))
+                # t.toc()  # 종료 시간
+
                 rays_o = rays[j:j + hparams.ray_chunk_size, :3]
                 rays_d = rays[j:j + hparams.ray_chunk_size, 3:6]
 
@@ -185,17 +220,24 @@ def main(hparams: Namespace) -> None:
 
             min_dist_ratios = torch.cat(min_dist_ratios).view(metadata['H'], metadata['W'], centroids.shape[0])
 
-            for i in range(centroids.shape[0]):
-                cluster_ratios = min_dist_ratios[:, :, i]
+            # print('centroid : {}'.format(centroids.shape[0]))
+            # t.toc()  # 종료 시간
+            for i_centroid in range(centroids.shape[0]):
+                # print('[{}/{}] i_centroid'.format(i_centroid, centroids.shape[0]))
+                # t.toc()  # 종료 시간
+
+                cluster_ratios = min_dist_ratios[:, :, i_centroid]
                 ray_in_cluster = cluster_ratios <= hparams.boundary_margin
 
                 filename = (metadata_path.stem + '.pt')
-                with ZipFile(output_path / str(i) / filename, compression=zipfile.ZIP_DEFLATED, mode='w') as zf:
+                with ZipFile(output_path / str(i_centroid) / filename, compression=zipfile.ZIP_DEFLATED, mode='w') as zf:
                     with zf.open(filename, 'w') as f:
                         torch.save(ray_in_cluster.cpu(), f)
 
                 del ray_in_cluster
 
+    print('Complete !!!!')
+    t.toc() # 종료 시간
 
 if __name__ == '__main__':
     main(_get_mask_opts())
